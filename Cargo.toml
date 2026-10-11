@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/tiangong-types",
-    "crates/tiangong-bots",
     "crates/tiangong-anthropic",
     "crates/tiangong-deepseek",
     "crates/tiangong-llm",
@@ -53,6 +52,7 @@ members = [
     "plugins/tiangong-plugin-scheduler/wasm",
     "plugins/tiangong-plugin-scheduler/sidecar",
     "plugins/tiangong-plugin-terminal/sidecar",
+    "plugins/tiangong-plugin-bot/sidecar",
     "plugins/tiangong-plugin-subagent/protocol",
     "plugins/tiangong-plugin-subagent/wasm",
     "plugins/tiangong-plugin-subagent/sidecar",
@@ -141,7 +141,6 @@ tiangong-sandbox = { path = "crates/tiangong-sandbox" }
 tiangong-scheduler = { path = "crates/tiangong-scheduler" }
 tiangong-relay = { path = "crates/tiangong-relay", default-features = false }
 tiangong-types = { path = "crates/tiangong-types" }
-tiangong-bots = { path = "crates/tiangong-bots" }
 
 anyhow = "1"
 arc-swap = "1"
