@@ -290,8 +290,6 @@ pub struct InterpreterLaunch {
 pub struct SensitiveStorageAccess {
     /// `models.json`（模型配置，含端点与密钥）——`model-config.read`。
     pub model_config: bool,
-    /// `mcp.json`（MCP server 配置）——MCP 插件所需。
-    pub mcp_config: bool,
     /// `server.json`（服务配置）——`app-storage.read`。
     pub server_config: bool,
     /// `app.json`（应用配置，含沙箱开关）——暂无授权路径，保留字段。
@@ -301,7 +299,7 @@ pub struct SensitiveStorageAccess {
 impl SensitiveStorageAccess {
     /// 是否值得注入存储根路径（至少一项可读才有意义）。
     pub fn any(self) -> bool {
-        self.model_config || self.mcp_config || self.server_config || self.app_config
+        self.model_config || self.server_config || self.app_config
     }
 }
 
