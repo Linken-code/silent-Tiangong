@@ -46,9 +46,17 @@ pub async fn post_message(mut req: Request) -> Result<Response> {
     let annotations = MessageAnnotations {
         instruction: body.instruction,
         render: body.render,
+        workspace: body.workspace,
     }
     .normalized()
     .map_err(|error| SilentError::business_error(StatusCode::BAD_REQUEST, error))?;
+    // 指定工作区须为已存在的工作区（全局工作目录或现有会话目录），入口即
+    // 拒绝：异步模式下后台失败只能写日志；且绝不据此新建目录。
+    {
+        let state = app.state.lock().await;
+        crate::remote::core::resolve_known_workspace(&state, annotations.workspace.as_deref())
+            .map_err(|error| SilentError::business_error(StatusCode::BAD_REQUEST, error))?;
+    }
     let media = body.media;
     let message_id = body
         .message_id

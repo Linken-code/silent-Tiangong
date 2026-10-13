@@ -286,11 +286,32 @@ pub(crate) fn session_for_workspace(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    // 映射即真相：登记即复用，不查会话文件——会话由宿主在首条消息到达时
-    // 创建（异步窗口），文件缺失是预期状态而非映射失效；被删会话的重置
-    // 走显式入口，不靠这里猜测。
-    if let Some(session_id) = mapped {
-        return Ok((session_id.to_string(), false));
+    // 映射即真相：登记即复用——会话由宿主在首条消息到达时创建（异步窗口），
+    // 文件缺失是预期状态而非映射失效；被删会话的重置走显式入口，不靠这里
+    // 猜测。唯一例外：会话已落盘但 cwd 不是本工作区（旧宿主丢弃了投递携带
+    // 的 workspace，会话落在全局工作目录），有对话后宿主不允许再改 cwd，
+    // 只能换新会话号重建；每个映射最多重建一次（`cwd_rebuilt`），避免在
+    // 仍未修复的宿主上每次投递都换会话。
+    if let Some(stale) = mapped {
+        let rebuilt = meta
+            .get(CWD_REBUILT_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if rebuilt || !session_cwd_mismatched(stale, workspace_path) {
+            return Ok((stale.to_string(), false));
+        }
+        let session_id = paths::new_id();
+        tracing::warn!(
+            agent_id,
+            workspace = workspace_path,
+            stale_session = stale,
+            new_session = %session_id,
+            "成员工作区会话的 cwd 与工作区不一致，重建会话"
+        );
+        meta["session_id"] = serde_json::Value::String(session_id.clone());
+        meta[CWD_REBUILT_KEY] = serde_json::Value::Bool(true);
+        paths::atomic_write(&meta_path, serde_json::to_string(&meta)?.as_bytes())?;
+        return Ok((session_id, true));
     }
 
     // 本工作区从未登记映射：老全局会话一次性迁移（会话须实际存在），
@@ -313,6 +334,75 @@ pub(crate) fn session_for_workspace(
     meta["session_id"] = serde_json::Value::String(session_id.clone());
     paths::atomic_write(&meta_path, serde_json::to_string(&meta)?.as_bytes())?;
     Ok((session_id, is_new))
+}
+
+/// 只读查询成员在该工作区的专属会话（列表/管理页展示用）：不登记工作区、
+/// 不创建目录、不写映射。
+///
+/// 依据与 [`session_for_workspace`] 一致：工作区映射中登记的会话；未登记时，
+/// 老成员的全局会话若工作在该工作区（且未被其他工作区占用）也算——首次
+/// 派活即沿用它。都没有返回 None。
+pub(crate) fn existing_workspace_session(
+    agents: &AgentStore,
+    agent_id: &str,
+    workspace_path: &str,
+    legacy_session: Option<&str>,
+) -> Option<String> {
+    let dir = agents.root().join(agent_id).join("workspaces");
+    let mapped = lookup_workspace_id(&dir, workspace_path).and_then(|ws_id| {
+        std::fs::read_to_string(dir.join(ws_id).join("workspace.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|meta| {
+                meta.get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+    });
+    if mapped.is_some() {
+        return mapped;
+    }
+    let legacy = legacy_session
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    (crate::sessions::session_exists(legacy)
+        && !legacy_session_mapped(&dir, legacy)
+        && legacy_session_cwd_matches(legacy, workspace_path))
+    .then(|| legacy.to_string())
+}
+
+/// 只读解析工作区身份（与 [`workspace_id_locked`] 同口径：canonical 路径
+/// 先查索引，再查各工作区登记的路径别名），未登记返回 None。
+fn lookup_workspace_id(dir: &std::path::Path, workspace_path: &str) -> Option<String> {
+    let workspace_path = std::fs::canonicalize(workspace_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| workspace_path.to_string());
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("index.json")).ok()?).ok()?;
+    let entries = index.get("workspaces")?.as_array()?;
+    let ids = entries
+        .iter()
+        .filter_map(|entry| Some((entry.get("id")?.as_str()?, entry.get("path")?.as_str())));
+    let mut alias_candidates = Vec::new();
+    for (id, path) in ids {
+        if path == Some(workspace_path.as_str()) {
+            return Some(id.to_string());
+        }
+        alias_candidates.push(id);
+    }
+    alias_candidates.into_iter().find_map(|id| {
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(id).join("workspace.json")).ok()?,
+        )
+        .ok()?;
+        meta.get("paths")?
+            .as_array()?
+            .iter()
+            .any(|p| p.as_str() == Some(workspace_path.as_str()))
+            .then(|| id.to_string())
+    })
 }
 
 /// 旧会话是否已被本成员任一工作区映射占用（防同一旧会话迁移到多个
@@ -339,23 +429,35 @@ fn legacy_session_mapped(dir: &std::path::Path, legacy: &str) -> bool {
 /// 旧会话的工作目录是否与给定工作区一致（canonicalize 后比较）——
 /// 只有会话本就工作在该项目下才沿用，避免把别的项目的会话错配过来。
 fn legacy_session_cwd_matches(session_id: &str, workspace_path: &str) -> bool {
-    let Some(cwd) = crate::sessions::load_session_json(session_id)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("cwd")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-    else {
-        return false;
-    };
+    session_cwd(session_id).is_some_and(|cwd| same_path(&cwd, workspace_path))
+}
+
+/// 映射元数据中「已因 cwd 不一致重建过」的标记键。
+const CWD_REBUILT_KEY: &str = "cwd_rebuilt";
+
+/// 会话已落盘且 cwd 明确不是该工作区。会话文件缺失/不可读/cwd 为空均视为
+/// 「未知」而非不一致（首条消息前的异步窗口）。
+fn session_cwd_mismatched(session_id: &str, workspace_path: &str) -> bool {
+    session_cwd(session_id).is_some_and(|cwd| !same_path(&cwd, workspace_path))
+}
+
+fn session_cwd(session_id: &str) -> Option<String> {
+    crate::sessions::load_session_json(session_id)
+        .ok()?
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string)
+}
+
+fn same_path(left: &str, right: &str) -> bool {
     let canonical = |path: &str| {
         std::fs::canonicalize(path)
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.to_string())
     };
-    !cwd.trim().is_empty() && canonical(&cwd) == canonical(workspace_path)
+    canonical(left) == canonical(right)
 }
 
 /// 反查会话归属的成员 ID：扫描全部成员的全部工作区映射，老全局绑定
@@ -546,6 +648,86 @@ mod tests {
         assert!(!is_new);
     }
 
+    #[serial_test::serial]
+    #[test]
+    fn 会话映射_会话cwd与工作区不一致时只重建一次() {
+        let (store, _root, agent_id) = store_with_agent("cwd-rebuild");
+        let w = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let p = w.path().to_string_lossy().into_owned();
+        let (s1, _) = session_for_workspace(&store, &agent_id, &p, None).unwrap();
+        // 旧宿主丢弃 workspace：会话落在其他目录。
+        create_session_file_with_cwd(&s1, Some(other.path()));
+        let (s2, is_new) = session_for_workspace(&store, &agent_id, &p, None).unwrap();
+        assert!(is_new, "cwd 不一致应换新会话并携带 workspace 创建");
+        assert_ne!(s1, s2);
+        // 宿主仍未修复、新会话再次落错目录：不再反复重建。
+        create_session_file_with_cwd(&s2, Some(other.path()));
+        let (s3, is_new) = session_for_workspace(&store, &agent_id, &p, None).unwrap();
+        assert_eq!(s2, s3);
+        assert!(!is_new);
+    }
+    #[serial_test::serial]
+    #[test]
+    fn 工作区会话只读查询_有记录才算且不产生登记() {
+        let (store, _root, agent_id) = store_with_agent("readonly-lookup");
+        let w1 = tempfile::tempdir().unwrap();
+        let w2 = tempfile::tempdir().unwrap();
+        let p1 = w1.path().to_string_lossy().into_owned();
+        let p2 = w2.path().to_string_lossy().into_owned();
+        let ws_dir = store.root().join(&agent_id).join("workspaces");
+        // 从未在任何工作区发起：无会话，且查询不创建任何登记。
+        assert_eq!(
+            existing_workspace_session(&store, &agent_id, &p1, None),
+            None
+        );
+        assert!(
+            !ws_dir.join("index.json").exists(),
+            "只读查询不得登记工作区"
+        );
+        // 在 W1 发起过：W1 有会话（与派活使用的会话一致），W2 仍无。
+        let (s1, _) = session_for_workspace(&store, &agent_id, &p1, None).unwrap();
+        assert_eq!(
+            existing_workspace_session(&store, &agent_id, &p1, None),
+            Some(s1.clone())
+        );
+        assert_eq!(
+            existing_workspace_session(&store, &agent_id, &p2, None),
+            None
+        );
+        let index = std::fs::read_to_string(ws_dir.join("index.json")).unwrap();
+        assert!(!index.contains(&p2), "查询 W2 不得登记 W2");
+    }
+    #[serial_test::serial]
+    #[test]
+    fn 工作区会话只读查询_老全局会话按工作目录计入() {
+        let (store, _root, agent_id) = store_with_agent("readonly-legacy");
+        let w = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let p = w.path().to_string_lossy().into_owned();
+        let po = other.path().to_string_lossy().into_owned();
+        create_session_file_with_cwd("legacy-ro", Some(w.path()));
+        assert_eq!(
+            existing_workspace_session(&store, &agent_id, &p, Some("legacy-ro")),
+            Some("legacy-ro".to_string())
+        );
+        assert_eq!(
+            existing_workspace_session(&store, &agent_id, &po, Some("legacy-ro")),
+            None
+        );
+    }
+    #[serial_test::serial]
+    #[test]
+    fn 会话映射_会话cwd一致时保持复用() {
+        let (store, _root, agent_id) = store_with_agent("cwd-match");
+        let w = tempfile::tempdir().unwrap();
+        let p = w.path().to_string_lossy().into_owned();
+        let (s1, _) = session_for_workspace(&store, &agent_id, &p, None).unwrap();
+        create_session_file_with_cwd(&s1, Some(w.path()));
+        let (s2, is_new) = session_for_workspace(&store, &agent_id, &p, None).unwrap();
+        assert_eq!(s1, s2);
+        assert!(!is_new);
+    }
     #[serial_test::serial]
     #[test]
     fn 会话映射_并发首次访问只产生一个会话() {

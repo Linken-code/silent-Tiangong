@@ -179,7 +179,9 @@ impl ServerCoreManager {
             .await
             .core_manager
             .session_exists(&requested_session_id);
-        let session_id = self.ensure_core_locked(&requested_session_id).await?;
+        let session_id = self
+            .ensure_core_locked(&requested_session_id, annotations.workspace.as_deref())
+            .await?;
 
         let msg_id = message_id.unwrap_or_else(|| scru128::new().to_string());
         // 附件准备成功后才登记 waiter，准备失败不会污染 tracker。
@@ -301,7 +303,15 @@ impl ServerCoreManager {
     }
 
     /// 调用方必须持有目标 session 的 `session_operation_lock`。
-    async fn ensure_core_locked(&self, requested_session_id: &str) -> Result<String> {
+    ///
+    /// `new_session_workspace`：会话尚不存在时使用的工作目录（须为已存在的
+    /// 工作区，见 [`resolve_known_workspace`]，否则拒绝）；已有会话始终沿用
+    /// 自身 cwd。
+    async fn ensure_core_locked(
+        &self,
+        requested_session_id: &str,
+        new_session_workspace: Option<&str>,
+    ) -> Result<String> {
         let session_id = normalize_session_id(requested_session_id)?;
 
         if self.core_manager.has_live_core(&session_id) {
@@ -326,8 +336,14 @@ impl ServerCoreManager {
                 .into_iter()
                 .find(|metadata| metadata.id == session_id)
                 .map(|metadata| metadata.cwd)
-                .filter(|cwd| !cwd.trim().is_empty())
-                .unwrap_or_else(|| state.workspace_dir.clone());
+                .filter(|cwd| !cwd.trim().is_empty());
+            let workspace_dir = match workspace_dir {
+                Some(cwd) => cwd,
+                // 新会话：指定的工作区须为已存在的工作区，否则拒绝。
+                None => resolve_known_workspace(&state, new_session_workspace)
+                    .map_err(anyhow::Error::msg)?
+                    .unwrap_or_else(|| state.workspace_dir.clone()),
+            };
             (
                 state.config.to_core_config(),
                 state.config.storage_root.clone(),
@@ -798,6 +814,51 @@ fn cleanup_created_attachment_paths(paths: &[std::path::PathBuf]) -> Result<()> 
     }
 }
 
+/// 校验调用方指定的新会话工作区：只接受**已存在的工作区**——全局工作目录
+/// 或某个现有会话的工作目录（按规范化路径比较），返回宿主登记的原路径。
+///
+/// 安全约束：远程调用方不得借此把会话落到任意目录（如 `/`、`~/.ssh`），
+/// 也绝不创建目录。未指定返回 `Ok(None)`；指定了但不是已存在的工作区返回
+/// `Err`，由入口拒绝请求（不静默回退，避免成员在错误目录执行）。
+pub fn resolve_known_workspace(
+    state: &tiangong_app_state::app_state::TiangongState,
+    workspace: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+    let Some(workspace) = workspace.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let requested = Path::new(workspace);
+    if !requested.is_absolute() {
+        return Err(format!("workspace 必须是绝对路径：{workspace}"));
+    }
+    let Ok(requested) = requested.canonicalize() else {
+        return Err(format!("workspace 不是已存在的工作区：{workspace}"));
+    };
+    if !requested.is_dir() {
+        return Err(format!("workspace 不是已存在的工作区：{workspace}"));
+    }
+    let known = std::iter::once(state.workspace_dir.clone()).chain(
+        state
+            .core_manager
+            .list_session_metadata()
+            .into_iter()
+            .map(|metadata| metadata.cwd),
+    );
+    for candidate in known {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if Path::new(candidate)
+            .canonicalize()
+            .is_ok_and(|path| path == requested)
+        {
+            return Ok(Some(candidate.to_string()));
+        }
+    }
+    Err(format!("workspace 不是已存在的工作区：{workspace}"))
+}
+
 fn normalize_session_id(session_id: &str) -> Result<String> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
@@ -1085,6 +1146,56 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[tokio::test]
+    async fn resolve_known_workspace_accepts_only_existing_workspaces() {
+        let _storage_guard = test_support::STORAGE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _home_guard = test_support::TestHomeGuard::new(&temp.path().join("home"));
+        let mut state = tiangong_app_state::app_state::TiangongState::new();
+        let global = temp.path().join("global");
+        let session_ws = temp.path().join("session-ws");
+        let unknown = temp.path().join("unknown");
+        for dir in [&global, &session_ws, &unknown] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        state.workspace_dir = global.to_string_lossy().into_owned();
+        let mut session = Session::new("ws");
+        session.cwd = session_ws.to_string_lossy().into_owned();
+        session.bind_storage_root(state.config.storage_root.clone());
+        session.try_persist_to_disk().unwrap();
+
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        // 未指定：交由调用方使用全局目录。
+        assert_eq!(resolve_known_workspace(&state, None), Ok(None));
+        assert_eq!(resolve_known_workspace(&state, Some("  ")), Ok(None));
+        // 全局工作目录与现有会话目录：接受（容忍首尾空白）。
+        assert_eq!(
+            resolve_known_workspace(&state, Some(&path(&global))),
+            Ok(Some(path(&global)))
+        );
+        assert_eq!(
+            resolve_known_workspace(&state, Some(&format!("  {}  ", path(&session_ws)))),
+            Ok(Some(path(&session_ws)))
+        );
+        // 存在但不是已知工作区、不存在、相对路径、文件：一律拒绝且不创建。
+        assert!(resolve_known_workspace(&state, Some(&path(&unknown))).is_err());
+        let missing = temp.path().join("missing");
+        assert!(resolve_known_workspace(&state, Some(&path(&missing))).is_err());
+        assert!(!missing.exists(), "校验不得创建目录");
+        assert!(resolve_known_workspace(&state, Some("relative/dir")).is_err());
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(resolve_known_workspace(&state, Some(&path(&file))).is_err());
+        // 经 `..` 绕行到已知目录按规范化路径识别。
+        let dotted = session_ws.join("..").join("session-ws");
+        assert_eq!(
+            resolve_known_workspace(&state, Some(&path(&dotted))),
+            Ok(Some(path(&session_ws)))
+        );
+        // 根目录不是已知工作区。
+        assert!(resolve_known_workspace(&state, Some("/")).is_err());
+    }
 
     use tiangong_core::config::core::CoreConfig;
     use tiangong_core::core::Plugin;
