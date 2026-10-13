@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "fetch",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "wasm": {
     "binary": "tiangong_plugin_fetch_wasm.wasm"
   },
