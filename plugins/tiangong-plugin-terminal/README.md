@@ -3,7 +3,7 @@
 终端能力的 manifest v2 插件化。工具声明与 prompt 引导来自本清单，经
 TsPluginAdapter 注入 Core。
 
-工具执行策略在 sidecar（`sidecar/src/service.rs`，Rust 进程）：plugin.json
+工具执行策略在 sidecar（`sidecar/src/service/`，Rust 进程，按职责分模块，见 `mod.rs` 模块说明）：plugin.json
 sidecar 握手通过 `tool:<name>` capabilities 注册五个工具 Handler，宿主把工具调用直连 sidecar，并随请求注入
 宿主权威会话上下文（`session_id` 与会话工作目录，来自 Session 真相源）。
 每个会话的终端编排（选终端、新建、开标签、执行、收结果）由 sidecar 内
@@ -22,6 +22,26 @@ sidecar 握手通过 `tool:<name>` capabilities 注册五个工具 Handler，宿
 执行命令——SSH 等远端行编辑器在正文与回车同包到达时偶发吞掉回车，分开
 写入可稳定触发执行。
 
+`enter: true` 发出的命令会等到真正结束才返回 `completed`，`wait`（默认
+10 秒，最大 110 秒）只是上限：本地 shell 按前台进程组回到 shell 判定，
+SSH 等交互程序内读不到对端进程，按发送前的提示符重新停在光标行判定；
+程序退出、前台回到登录 shell 也判为完成。提示符变了（远端 `cd` 改了带
+路径的提示符、REPL 续行 `...`、`[sudo] password:`）时，输出静默 1.5 秒
+且光标停在一行未完成文本上即返回 `interactive` 交还控制权，终端不会被
+永久锁住。发送 `\x03` 只是把中断键交给程序（只含控制键的输入即使带了
+`enter: true` 也按按键直接写入，不会被当作新命令拒绝）：程序真被中断
+后提示符重绘即完成；忽略中断的程序仍在跑时新命令继续被拒绝，避免排进
+输入缓冲、等程序结束才执行。
+超过上限仍未结束返回 `still_running` 与截至目前的新增输出；此时再以
+`enter: true` 发送新命令会被拒绝且不写入（否则会被排进 tty 输入缓冲延后
+执行，输出整体错位），`input` 留空且不设 `enter` 即继续等待并增量读取。
+`run_command` / `run_shell` 不复用前台被程序占据的终端（如已 SSH 登录）。
+
+终端里 `&` / `nohup` 启动的后台进程留在登录 shell 的会话里，sidecar 会
+登记这些会话：仍有存活的后台进程时不做空闲退出（退出后新 sidecar 在另一
+个沙箱实例中，无权向其发信号），`terminal_status` 概要以
+`background_jobs` 列出其 pid、进程名与所属终端，供 Agent 用 `kill` 结束。
+
 sidecar 执行中经进度帧请求宿主 App 原语（`host_action`，白名单
 `app.open` / `app.close`）：长任务执行期间终端标签即时建立，用户可
 实时查看输出。Agent 新建终端时，隐藏标签先完成输出订阅和精确 PTY
@@ -32,6 +52,19 @@ sidecar 执行中经进度帧请求宿主 App 原语（`host_action`，白名单
 标签时，页面按天工会话提交当前仍存活的终端编号全集，sidecar 只回收该
 会话中已不在列表内的终端。前端关闭不等待回收结果，再次打开会创建全新
 终端。Sub Agent / Bot 等后台会话无需任何页面实例即可独立执行终端工具。
+
+## 使用引导
+
+prompt 与工具说明引导 Agent 以 PTY 终端的方式工作：
+
+- 执行命令优先用 `run_command`，多步操作拆成多次调用逐步执行；终端自动
+  复用并保持工作目录与环境，无需把多步拼成一段脚本。`run_shell` 只用于
+  执行已有脚本，或需要管道、重定向等 shell 语法的单条命令。
+- 不用 `nohup` / `&` 后台启动。插件支持多终端并行：长期运行的服务用
+  `terminal_open` 新开终端、`terminal_send` 在前台运行，用完 `\x03` 停止。
+
+sidecar 在 `run_command` / `run_shell` 结果摘要末尾对这两类写法给出替代
+做法（`service/advice.rs`，只提示不拦截，命令照常执行）。
 
 ## 开发循环
 
