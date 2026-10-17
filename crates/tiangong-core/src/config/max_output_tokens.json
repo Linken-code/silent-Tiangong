@@ -1,0 +1,20 @@
+{
+  "_comment": "ReAct 主循环单次最大输出 token（含 thinking），编译时内嵌进 tiangong-core。匹配：模型名转小写后精确 > 最长前缀 > _default。数值取自各厂商官方文档；文档写 nK 的按 n*1000 取下限，避免超限。",
+  "_default": 128000,
+
+  "claude-opus-5": 128000,
+  "claude-sonnet-5": 128000,
+  "claude-fable-5": 128000,
+  "claude-haiku-5": 128000,
+
+  "gpt-5.5": 128000,
+  "gpt-5.4": 128000,
+
+  "deepseek-v4": 384000,
+  "deepseek-flash": 384000,
+
+  "kimi-k3": 131072,
+  "kimi-k2": 32768,
+
+  "glm-5": 128000
+}
