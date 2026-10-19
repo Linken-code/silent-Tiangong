@@ -423,31 +423,46 @@ fn compression_split_point(session: &Session) -> Option<usize> {
 }
 
 /// 构造 LLM 可见、用户不可见的锚点消息：`User` 角色（满足 Provider 首条
-/// 约束）+ `CompressedResume` 来源（前端不展示/搜索/编辑）+ `ModelInstruction`
-/// 内容块（进入模型请求，不属于用户可见文本）。内容是被折叠锚点的原文，
-/// 由程序直接复制，不经过 LLM 提取。
-fn build_anchor_resume_message(anchor_text: &str) -> Message {
-    Message::with_role(
-        Role::user(),
-        vec![ContentBlock::model_instruction(format!(
-            "用户当前请求（压缩后原文保留）：\n\n{anchor_text}"
-        ))],
-    )
-    .with_source(UserSource::CompressedResume)
+/// 约束）+ `CompressedResume` 来源（前端不展示/搜索/编辑，索引与后续压缩
+/// 亦排除）。内容由 [`folded_anchor_content`] 从被折叠的锚点消息原样复制。
+fn build_anchor_resume_message(content: Vec<ContentBlock>) -> Message {
+    Message::with_role(Role::user(), content).with_source(UserSource::CompressedResume)
 }
 
-/// 被折叠区间内最后一条可见用户消息的文本（锚点原文）。
+/// 被折叠区间内最后一条真人用户消息的完整内容（锚点原文），前置一句
+/// 来源说明。
 ///
 /// 非真人来源的用户消息（图片注入/压缩恢复锚点/Agent 协作）不是真实用户输入，
-/// 其 text_content 为空，必须排除——否则折叠区间末尾恰是注入消息时
-/// 锚点取到空文本被过滤，用户原始请求丢失（评审问题 3）。
-fn folded_anchor_text(session: &Session, folded_end: usize) -> Option<String> {
+/// 必须排除——否则折叠区间末尾恰是注入消息时锚点取错，用户原始请求丢失
+/// （评审问题 3）。
+///
+/// 内容块原样复制（仅清除瞬态数据），不改写、不补充：只发附件的请求同样
+/// 保留附件引用与路径说明，而不会因为没有文字被丢弃。
+fn folded_anchor_content(session: &Session, folded_end: usize) -> Option<Vec<ContentBlock>> {
     let start = session.summary_up_to.min(folded_end);
-    (start..folded_end)
+    let anchor = (start..folded_end)
         .rev()
-        .find(|index| session.messages[*index].is_user_input())
-        .map(|index| session.messages[index].text_content())
-        .filter(|text| !text.trim().is_empty())
+        .map(|index| &session.messages[index])
+        .find(|message| message.is_user_input())?;
+    let original = anchor
+        .content
+        .iter()
+        .filter(|block| !block.is_empty())
+        .cloned()
+        .map(|mut block| {
+            block.clear_transient_data();
+            block
+        })
+        .collect::<Vec<_>>();
+    if original.is_empty() {
+        return None;
+    }
+    let mut content = Vec::with_capacity(1 + original.len());
+    content.push(ContentBlock::model_instruction(
+        "用户当前请求（压缩后原文保留）：",
+    ));
+    content.extend(original);
+    Some(content)
 }
 
 fn start_task(
@@ -536,11 +551,11 @@ fn apply_compression(
         .get(update.summary_up_to)
         .is_none_or(|message| message.role != MessageRole::User);
     if needs_anchor
-        && let Some(anchor_text) = folded_anchor_text(&ctx.session, update.summary_up_to)
+        && let Some(anchor_content) = folded_anchor_content(&ctx.session, update.summary_up_to)
     {
         candidate.messages.insert(
             update.summary_up_to,
-            build_anchor_resume_message(&anchor_text),
+            build_anchor_resume_message(anchor_content),
         );
     }
     candidate.context_summary = Some(update.summary.clone());
@@ -695,7 +710,7 @@ mod tests {
     /// 真实输入文本）时，锚点必须越过它取到更早的真实用户消息，
     /// 而不是取到空文本后放弃导致用户原请求丢失。
     #[test]
-    fn folded_anchor_text_skips_host_injected_and_finds_real_user_message() {
+    fn folded_anchor_content_skips_host_injected_and_finds_real_user_message() {
         let mut session = Session::new("anchor-test");
         session
             .messages
@@ -711,11 +726,49 @@ mod tests {
         )];
         session.messages.push(injected);
 
-        let anchor = folded_anchor_text(&session, session.messages.len());
+        let anchor = folded_anchor_content(&session, session.messages.len())
+            .expect("锚点必须越过注入消息取到真实用户请求");
         assert_eq!(
-            anchor.as_deref(),
-            Some("帮我总结群聊"),
-            "锚点必须越过注入消息取到真实用户请求"
+            anchor,
+            vec![
+                ContentBlock::model_instruction("用户当前请求（压缩后原文保留）："),
+                ContentBlock::text("帮我总结群聊"),
+            ]
+        );
+    }
+
+    /// 只发附件、没有文字的请求被折叠时，锚点原样保留附件引用与路径说明，
+    /// 不补任何文字（此前取文本为空即放弃，整条请求丢失）。
+    #[test]
+    fn folded_anchor_keeps_attachment_only_request() {
+        let asset = tiangong_types::StoredAsset {
+            asset_id: "img-1".to_string(),
+            local_path: "/media/images/photo.png".to_string(),
+            original_name: "photo.png".to_string(),
+            mime_type: "image/png".to_string(),
+            size: 9,
+            kind: tiangong_types::MediaKind::Image,
+        };
+        let note = ContentBlock::model_instruction(
+            "本条消息中的图片已归档，本地工具需要读取时直接使用：index=0 path=/media/images/photo.png",
+        );
+        let mut session = Session::new("anchor-attachment");
+        let mut user = Message::new(MessageRole::User, "");
+        user.content = vec![ContentBlock::asset_reference(asset.clone()), note.clone()];
+        session.messages.push(user);
+        session
+            .messages
+            .push(Message::new(MessageRole::Assistant, "已收到图片"));
+
+        let anchor = folded_anchor_content(&session, session.messages.len())
+            .expect("只有附件的请求也必须生成锚点");
+        assert_eq!(
+            anchor,
+            vec![
+                ContentBlock::model_instruction("用户当前请求（压缩后原文保留）："),
+                ContentBlock::asset_reference(asset),
+                note,
+            ]
         );
     }
 

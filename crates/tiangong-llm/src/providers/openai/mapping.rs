@@ -210,25 +210,13 @@ fn build_input_items(req: &ProviderRequest) -> Result<Value> {
 }
 
 fn build_user_item(message: &ChatMessage) -> Result<Option<Value>> {
-    let images = message
+    let has_media = message
         .content
         .iter()
-        .filter_map(|content| match content {
-            MessageContent::Image(image) => Some(image),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let files = message
-        .content
-        .iter()
-        .filter_map(|content| match content {
-            MessageContent::File(file) => Some(file),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let text = collect_text(message);
+        .any(|content| matches!(content, MessageContent::Image(_) | MessageContent::File(_)));
 
-    if images.is_empty() && files.is_empty() {
+    if !has_media {
+        let text = collect_text(message);
         if text.trim().is_empty() {
             return Ok(None);
         }
@@ -239,29 +227,37 @@ fn build_user_item(message: &ChatMessage) -> Result<Option<Value>> {
         })));
     }
 
+    // 多模态消息按 ChatMessage 内容块原始顺序逐块映射（与 Anthropic /
+    // Chat Completions 一致），适配层不重排内容。
     let mut content = Vec::new();
-    if !text.trim().is_empty() {
-        content.push(json!({ "type": "input_text", "text": text }));
-    }
-    for image in images {
-        content.push(json!({
-            "type": "input_image",
-            "image_url": image.data,
-        }));
-    }
-    // 文档附件（PDF/Office）的 Responses API 原生 file block 映射。
-    // 官方规范：{ "type": "file", "file": { "filename": "...", "file_data": "data:<mime>;base64,..." } }
-    // 注：当前上层策略下文件附件统一走本地脚本解析，不会产生 MessageContent::File；
-    // 此分支保留以支持未来直传场景，并维持 provider 层映射的完整性。
-    for file in files {
-        let filename = file_filename_with_fallback(&file.title, &file.mime_type);
-        content.push(json!({
-            "type": "file",
-            "file": {
-                "filename": filename,
-                "file_data": file.data,
+    for block in &message.content {
+        match block {
+            MessageContent::Image(image) => content.push(json!({
+                "type": "input_image",
+                "image_url": image.data,
+            })),
+            // 文档附件（PDF/Office）的 Responses API 原生 file block 映射。
+            // 官方规范：{ "type": "file", "file": { "filename": "...", "file_data": "data:<mime>;base64,..." } }
+            // 注：当前上层策略下文件附件统一走本地脚本解析，不会产生 MessageContent::File；
+            // 此分支保留以支持未来直传场景，并维持 provider 层映射的完整性。
+            MessageContent::File(file) => {
+                let filename = file_filename_with_fallback(&file.title, &file.mime_type);
+                content.push(json!({
+                    "type": "file",
+                    "file": {
+                        "filename": filename,
+                        "file_data": file.data,
+                    }
+                }));
             }
-        }));
+            other => {
+                if let Some(text) = text_part(other)
+                    && !text.trim().is_empty()
+                {
+                    content.push(json!({ "type": "input_text", "text": text }));
+                }
+            }
+        }
     }
     Ok(Some(json!({
         "type": "message",
@@ -274,18 +270,22 @@ fn collect_text(message: &ChatMessage) -> String {
     message
         .content
         .iter()
-        .filter_map(|content| match content {
-            MessageContent::Text(text) => Some(text.clone()),
-            MessageContent::ToolResult(result) => Some(match &result.content {
-                crate::tool::ToolResultContent::Text(text) => text.clone(),
-                crate::tool::ToolResultContent::Json(value) => value.to_string(),
-            }),
-            // File 由 build_user_item 走原生 file block，此处不再降级为文本，
-            // 避免 base64 data URL 塞进文本导致 token 膨胀且模型无法读取。
-            _ => None,
-        })
+        .filter_map(text_part)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn text_part(content: &MessageContent) -> Option<String> {
+    match content {
+        MessageContent::Text(text) => Some(text.clone()),
+        MessageContent::ToolResult(result) => Some(match &result.content {
+            crate::tool::ToolResultContent::Text(text) => text.clone(),
+            crate::tool::ToolResultContent::Json(value) => value.to_string(),
+        }),
+        // File 由 build_user_item 走原生 file block，此处不再降级为文本，
+        // 避免 base64 data URL 塞进文本导致 token 膨胀且模型无法读取。
+        _ => None,
+    }
 }
 
 /// 推断文档附件的文件名，供 Responses API 的 file block 使用。
@@ -825,6 +825,49 @@ mod tests {
         assert_eq!(base, "https://api.openai.com/v1");
         let err = normalize_api_base("  ");
         assert!(err.is_err(), "空 base_url 应报错：{err:?}");
+    }
+
+    #[test]
+    fn user_item_preserves_content_block_order() {
+        // 多模态消息逐块映射：输出顺序与输入内容块顺序一致，不重排。
+        let image = |data: &str| {
+            MessageContent::Image(crate::message::ImageContent {
+                mime_type: "image/png".to_string(),
+                data: data.to_string(),
+            })
+        };
+        let message = ChatMessage::new(
+            MessageRole::User,
+            vec![
+                MessageContent::Text("t0".to_string()),
+                image("data:image/png;base64,AAA"),
+                MessageContent::Text("t1".to_string()),
+                image("data:image/png;base64,BBB"),
+                MessageContent::Text("t2".to_string()),
+            ],
+        );
+        let item = build_user_item(&message)
+            .unwrap()
+            .expect("应生成 user item");
+        let content = item["content"].as_array().expect("应有 content 数组");
+        let shape = content
+            .iter()
+            .map(|block| match block["type"].as_str() {
+                Some("input_text") => format!("text:{}", block["text"].as_str().unwrap()),
+                Some("input_image") => format!("image:{}", block["image_url"].as_str().unwrap()),
+                other => panic!("意外的内容块类型：{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            vec![
+                "text:t0",
+                "image:data:image/png;base64,AAA",
+                "text:t1",
+                "image:data:image/png;base64,BBB",
+                "text:t2",
+            ]
+        );
     }
 
     #[test]
