@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::context::model_request::IntoModelRequest;
 use crate::context::organizer::ContextOrganizer;
 use crate::core::command::Command;
 use crate::core::plugin::Plugin;
 use crate::formatting::{format_llm_output_message, format_tool_trace_message};
 use crate::permission::TrustMode;
-use crate::react::context::{emit_token_usage, persist_error, select_client_for_request};
+use crate::react::context::{emit_token_usage, persist_error};
 use crate::react::message::*;
 use crate::runtime::LlmOutputRecord;
 use crate::stream_throttle::{StreamTextKind, ThrottledStreamSink};
@@ -409,26 +410,26 @@ impl AgentLoopState {
 
 // 阶段数据类型统一定义在 super::phase。
 
-fn build_react_request(ctx: &TurnContext) -> ModelRequest {
-    ModelRequest {
-        session_id: Some(ctx.session.id.clone()),
-        user_input: String::new(),
-        context: ctx.session.context(),
-        reasoning_effort: ctx.agent_config.reasoning_effort,
-        max_output_tokens: Some(crate::config::max_output::max_output_tokens(
-            ctx.client().model_name(),
-        )),
-        ..Default::default()
-    }
-}
-
 fn start_llm_request(
     ctx: &TurnContext,
-    request: ModelRequest,
     purpose: LlmPurpose,
     text_kind: StreamTextKind,
     tool_choice: Option<ToolChoice>,
 ) -> ActiveLlm {
+    // 由当前会话上下文构造请求；转换失败（如缺少 system prompt）时由请求
+    // 任务返回错误，与模型请求失败走同一条恢复/失败链路。
+    let request = ctx
+        .session
+        .context()
+        .into_model_request()
+        .map(|request| ModelRequest {
+            session_id: Some(ctx.session.id.clone()),
+            reasoning_effort: ctx.agent_config.reasoning_effort,
+            max_output_tokens: Some(crate::config::max_output::max_output_tokens(
+                ctx.client().model_name(),
+            )),
+            ..request
+        });
     let pending_msg_id = scru128::new().to_string();
     let sink = ThrottledStreamSink::with_text_kind(
         pending_msg_id.clone(),
@@ -436,11 +437,11 @@ fn start_llm_request(
         text_kind,
     );
     let (chunk_tx, chunk_rx) = tokio_mpsc::unbounded_channel();
-    let client = select_client_for_request(ctx, &request).clone();
+    let client = ctx.client().clone();
     let tools = ctx.tools.clone();
     let task = tokio::spawn(async move {
         client
-            .stream_async(request.with_tools(tools, tool_choice), chunk_tx)
+            .stream_async(request?.with_tools(tools, tool_choice), chunk_tx)
             .await
     });
 
@@ -710,7 +711,6 @@ pub(super) async fn execute_turn(
                 }
                 let active = start_llm_request(
                     ctx,
-                    build_react_request(ctx),
                     LlmPurpose::React {
                         request_injection_generation,
                     },
