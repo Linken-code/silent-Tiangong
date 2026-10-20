@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "fs",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "wasm": {
     "binary": "tiangong_plugin_fs_wasm.wasm"
   },
@@ -20,5 +20,13 @@
     "cli",
     "server",
     "desktop"
-  ]
+  ],
+  "resources": [
+    "assets"
+  ],
+  "tool_icons": {
+    "file_read": "assets/tool-file-read.svg",
+    "file_write": "assets/tool-file-write.svg",
+    "current_time": "assets/tool-clock.svg"
+  }
 }
